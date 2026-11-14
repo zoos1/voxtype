@@ -73,14 +73,23 @@ mod mac {
     // Layout, in points. About 40% of the first version's size.
     const FONT_SIZE: f64 = 12.0;
     const FONT_NAMES: [&str; 2] = ["JetBrainsMono-Light", "JetBrainsMonoNL-Light"];
-    const MAX_TEXT_WIDTH: f64 = 256.0;
+    // Transcript lines wrap at ~40 characters: phone feeds in portrait
+    // land at 30-50 (Baymard: 50-75 is for wider desktop columns).
+    const LINE_CHARS: usize = 40;
+    const MAX_TEXT_WIDTH: f64 = 290.0; // fallback if the font cannot be measured
     const PAD_X: f64 = 12.0;
     const PAD_Y: f64 = 8.0;
     const GAP: f64 = 10.0;
     const MIN_WIDTH: f64 = 72.0;
     const CORNER: f64 = 10.0;
-    const MAX_TEXT_CHARS: usize = 220;
-    const MAX_LINES: isize = 6;
+    const MAX_TEXT_CHARS: usize = 400;
+    const MAX_LINES: isize = 10;
+    // Transcript display time: ~238 wpm adult silent reading (Brysbaert
+    // 2019), so 0.25 s a word plus a second to find the panel.
+    const SECS_PER_WORD: f64 = 0.25;
+    const LINGER_BASE: f64 = 1.0;
+    const LINGER_MIN: f64 = 1.5;
+    const LINGER_MAX: f64 = 12.0;
     /// Smoke: near-black grey, mostly see-through.
     const SMOKE: (f64, f64, f64, f64) = (0.10, 0.10, 0.11, 0.55);
 
@@ -93,9 +102,25 @@ mod mac {
 
     const DOT_COLS: usize = 30;
     const DOT_ROWS_HALF: usize = 3; // dots above and below the center line
-    const SPEC_COLS: usize = 56;
-    const SPEC_ROWS: usize = 10;
-    const FFT_N: usize = 1024;
+    const SPEC_COLS: usize = 64;
+    const SPEC_ROWS: usize = 24;
+    const FFT_N: usize = 2048;
+    const BAND_LO: f32 = 80.0;
+    const BAND_HI: f32 = 8000.0;
+
+    // Voice gate: the panel shows from speech onset until a pause. Levels
+    // are dB above a per-band noise floor that adapts to the room.
+    const VOICE_ON_DB: f32 = 14.0;
+    const VOICE_OFF_DB: f32 = 8.0;
+    const VOICE_ON_TICKS: u32 = 4; // ~130 ms: a syllable, not a key click
+    const HANG_TICKS: u32 = 36; // ~1.2 s of quiet before the panel fades
+    const FLOOR_WINDOW: usize = 90; // ticks, ~3 s
+    const DIGITAL_SILENCE_DB: f32 = -120.0;
+    const WARMUP_DB: f32 = -100.0; // band mean below this is mic warm-up
+    const WARMUP_TICKS: u32 = 6; // ~200 ms
+    const PEAK_FALL_DB: f32 = 0.2; // per tick, ~6 dB/s
+    const MIN_RANGE_DB: f32 = 30.0; // excess that reads as full yellow, at least
+    const SHOW_DB: f32 = 6.0; // excess below this draws nothing
 
     fn now_ms() -> u64 {
         SystemTime::now()
@@ -192,13 +217,6 @@ mod mac {
             }
         }
 
-        fn rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, rgb: (f32, f32, f32), a: f32) {
-            for y in y0.round() as i32..y1.round() as i32 {
-                for x in x0.round() as i32..x1.round() as i32 {
-                    self.blend(x, y, rgb, a);
-                }
-            }
-        }
     }
 
     /// Waveform of white dots: one column per time step, mirrored around the
@@ -251,21 +269,43 @@ mod mac {
         STOPS[3].1
     }
 
-    /// Spectrogram: time left → right, frequency bottom → top.
+    /// Spectrogram: time left → right, frequency bottom → top. Cells are
+    /// interpolated per pixel, so the image is continuous (no grid seams).
+    /// `t` = 0 is silence and draws nothing; low `t` is dark purple, the
+    /// loudest parts yellow. The oldest columns fade out on the left.
     fn draw_spectrum(c: &mut Canvas, cols: &VecDeque<[f32; SPEC_ROWS]>) {
         c.clear();
+        let n = cols.len().min(SPEC_COLS);
+        if n == 0 {
+            return;
+        }
+        let skip = cols.len() - n;
+        let offset = (SPEC_COLS - n) as f32;
         let cw = PX_W as f32 / SPEC_COLS as f32;
-        let ch = PX_H as f32 / SPEC_ROWS as f32;
-        let offset = SPEC_COLS.saturating_sub(cols.len());
-        for (i, col) in cols.iter().enumerate() {
-            let x = (offset + i) as f32 * cw;
-            for (row, &t) in col.iter().enumerate() {
-                if t <= 0.02 {
+        let rh = PX_H as f32 / SPEC_ROWS as f32;
+        let at = |i: f32, r: f32| -> f32 {
+            let i = (i.max(0.0) as usize).min(n - 1);
+            let r = (r.max(0.0) as usize).min(SPEC_ROWS - 1);
+            cols[skip + i][r]
+        };
+        for y in 0..PX_H {
+            let v = ((PX_H - 1 - y) as f32 + 0.5) / rh - 0.5;
+            let (r0, fv) = (v.floor(), v - v.floor());
+            for x in 0..PX_W {
+                let u = (x as f32 + 0.5) / cw - 0.5 - offset;
+                if u < -0.5 {
+                    continue; // left of the oldest column
+                }
+                let (i0, fu) = (u.floor(), u - u.floor());
+                let top = at(i0, r0 + 1.0) * (1.0 - fu) + at(i0 + 1.0, r0 + 1.0) * fu;
+                let bot = at(i0, r0) * (1.0 - fu) + at(i0 + 1.0, r0) * fu;
+                let t = bot * (1.0 - fv) + top * fv;
+                if t <= 0.002 {
                     continue;
                 }
-                let y = PX_H as f32 - (row as f32 + 1.0) * ch;
-                let a = (t / 0.45).clamp(0.0, 1.0).powf(0.8);
-                c.rect(x + 0.5, y + 0.5, x + cw - 0.5, y + ch - 0.5, heat(t), a);
+                let fade = (x as f32 / (PX_W as f32 * 0.12)).min(1.0);
+                let a = (t / 0.06).min(1.0) * 0.95 * fade;
+                c.blend(x as i32, y as i32, heat(t), a);
             }
         }
     }
@@ -307,6 +347,9 @@ mod mac {
         amps: Vec<f32>,
         frames_in_col: usize,
         col_peak: f32,
+        floor: Floor,
+        gate: VoiceGate,
+        shown: bool,
     }
 
     impl Levels {
@@ -318,6 +361,9 @@ mod mac {
                 amps: vec![0.0; DOT_COLS],
                 frames_in_col: 0,
                 col_peak: -120.0,
+                floor: Floor::new(),
+                gate: VoiceGate::default(),
+                shown: false,
             }
         }
 
@@ -325,6 +371,9 @@ mod mac {
             self.amps.iter_mut().for_each(|a| *a = 0.0);
             self.frames_in_col = 0;
             self.col_peak = -120.0;
+            self.floor = Floor::new();
+            self.gate = VoiceGate::default();
+            self.shown = false;
         }
 
         fn poll(&mut self) {
@@ -359,6 +408,12 @@ mod mac {
                 .map(|c| AudioFrame::from_bytes(c.try_into().expect("frame size")))
                 .collect();
             self.pending.drain(..whole);
+            if let Some(tick_peak) = frames.iter().map(|f| f.peak_dbfs).reduce(f32::max) {
+                if tick_peak > DIGITAL_SILENCE_DB {
+                    let floor = self.floor.update(tick_peak);
+                    self.shown = self.gate.update(tick_peak - floor);
+                }
+            }
             // 100 Hz frames, 4 per column: the waveform covers ~1.2 s.
             for f in frames {
                 self.col_peak = self.col_peak.max(f.peak_dbfs);
@@ -478,7 +533,8 @@ mod mac {
         }
     }
 
-    /// Log-spaced band loudness (0..1) from 100 Hz to 7.5 kHz.
+    /// Log-spaced band levels in dBFS (a full-scale sine reads 0 dB), from
+    /// BAND_LO to BAND_HI.
     fn bands(samples: &[f32], rate: f32) -> [f32; SPEC_ROWS] {
         let n = samples.len();
         let mut re: Vec<f32> = samples
@@ -492,7 +548,7 @@ mod mac {
         let mut im = vec![0.0; n];
         fft(&mut re, &mut im);
         let norm = n as f32 / 4.0; // Hann window gain 0.5, one-sided x2
-        let (lo, hi) = (100.0f32, 7500.0f32);
+        let (lo, hi) = (BAND_LO, BAND_HI);
         let mut out = [0.0; SPEC_ROWS];
         for (b, slot) in out.iter_mut().enumerate() {
             let f0 = lo * (hi / lo).powf(b as f32 / SPEC_ROWS as f32);
@@ -502,10 +558,135 @@ mod mac {
             let peak = (k0..k1)
                 .map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt() / norm)
                 .fold(0.0f32, f32::max);
-            let db = 20.0 * peak.max(1e-9).log10();
-            *slot = ((db + 80.0) / 55.0).clamp(0.0, 1.0);
+            *slot = 20.0 * peak.max(1e-9).log10();
         }
         out
+    }
+
+    /// Room noise floor: the 10th percentile of the last FLOOR_WINDOW levels.
+    /// Speech has gaps between syllables, so this sits on the room's level
+    /// even while you talk, and one odd quiet frame cannot drag it down.
+    struct Floor {
+        hist: VecDeque<f32>,
+    }
+
+    impl Floor {
+        fn new() -> Self {
+            Self {
+                hist: VecDeque::with_capacity(FLOOR_WINDOW + 1),
+            }
+        }
+
+        fn update(&mut self, level: f32) -> f32 {
+            if self.hist.len() == FLOOR_WINDOW {
+                self.hist.pop_front();
+            }
+            self.hist.push_back(level);
+            let mut v: Vec<f32> = self.hist.iter().copied().collect();
+            v.sort_by(f32::total_cmp);
+            v[(v.len() - 1) / 10]
+        }
+    }
+
+    /// Speech detector with hysteresis and a hangover, fed once per tick
+    /// with the level above the noise floor (dB).
+    #[derive(Default)]
+    struct VoiceGate {
+        over: u32,
+        voiced: bool,
+        hang: u32,
+    }
+
+    impl VoiceGate {
+        /// Returns whether the panel should show: from speech onset until
+        /// HANG_TICKS of quiet.
+        fn update(&mut self, excess: f32) -> bool {
+            self.over = if excess > VOICE_ON_DB { self.over + 1 } else { 0 };
+            self.voiced = self.over >= VOICE_ON_TICKS || (self.voiced && excess > VOICE_OFF_DB);
+            self.hang = if self.voiced {
+                HANG_TICKS
+            } else {
+                self.hang.saturating_sub(1)
+            };
+            self.hang > 0
+        }
+    }
+
+    /// Spectrogram state: smoothed band levels, per-band noise floors, and a
+    /// decaying loudness peak so the loudest recent speech reads yellow and
+    /// quieter speech reads purple, whatever the mic gain.
+    struct Spectro {
+        cols: VecDeque<[f32; SPEC_ROWS]>,
+        smooth: [f32; SPEC_ROWS],
+        floor: [f32; SPEC_ROWS],
+        floors: Vec<Floor>,
+        frames: u32,
+        peak: f32,
+        started: bool,
+        gate: VoiceGate,
+        shown: bool,
+    }
+
+    impl Spectro {
+        fn new() -> Self {
+            Self {
+                cols: VecDeque::with_capacity(SPEC_COLS + 1),
+                smooth: [0.0; SPEC_ROWS],
+                floor: [0.0; SPEC_ROWS],
+                floors: (0..SPEC_ROWS).map(|_| Floor::new()).collect(),
+                frames: 0,
+                peak: MIN_RANGE_DB,
+                started: false,
+                gate: VoiceGate::default(),
+                shown: false,
+            }
+        }
+
+        /// Add one analysis frame (band levels in dB); returns whether the
+        /// panel should show. Columns are blank while no one is speaking.
+        fn push(&mut self, db: [f32; SPEC_ROWS]) -> bool {
+            // The input warms up with zeros or near-zeros for a few buffers;
+            // they say nothing about the room, so skip them. A real mic in a
+            // quiet room still averages well above WARMUP_DB per band.
+            self.frames += 1;
+            let mean = db.iter().sum::<f32>() / SPEC_ROWS as f32;
+            if self.frames <= WARMUP_TICKS || mean < WARMUP_DB {
+                return self.shown;
+            }
+            if !self.started {
+                self.started = true;
+                self.smooth = db;
+            }
+            let mut excess = [0.0f32; SPEC_ROWS];
+            for b in 0..SPEC_ROWS {
+                let k = if db[b] > self.smooth[b] { 0.65 } else { 0.35 };
+                self.smooth[b] += (db[b] - self.smooth[b]) * k;
+                self.floor[b] = self.floors[b].update(self.smooth[b]);
+                excess[b] = (self.smooth[b] - self.floor[b]).max(0.0);
+            }
+            // Voice energy sits in a handful of bands: average the top 8.
+            let mut sorted = excess;
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let voice = sorted[..8].iter().sum::<f32>() / 8.0;
+            self.shown = self.gate.update(voice);
+
+            let top = excess.iter().copied().fold(0.0f32, f32::max);
+            self.peak = (self.peak - PEAK_FALL_DB).max(top).max(MIN_RANGE_DB);
+            let mut col = [0.0f32; SPEC_ROWS];
+            if self.gate.voiced {
+                for (c, &e) in col.iter_mut().zip(&excess) {
+                    if e >= SHOW_DB {
+                        let t = ((e - SHOW_DB) / (self.peak - SHOW_DB)).clamp(0.0, 1.0);
+                        *c = t.powf(1.2).max(0.02);
+                    }
+                }
+            }
+            if self.cols.len() == SPEC_COLS {
+                self.cols.pop_front();
+            }
+            self.cols.push_back(col);
+            self.shown
+        }
     }
 
     // ---------------------------------------------------------------- window
@@ -520,6 +701,7 @@ mod mac {
         mtm: MainThreadMarker,
         shown_key: String,
         alpha: f64,
+        line_w: f64,
     }
 
     fn overlay_font() -> Retained<NSFont> {
@@ -585,11 +767,17 @@ mod mac {
                 let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
                 label.setTextColor(Some(&NSColor::whiteColor()));
                 label.setFont(Some(&overlay_font()));
-                label.setAlignment(NSTextAlignment::Center);
+                label.setAlignment(NSTextAlignment::Left);
                 label.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
                 label.setMaximumNumberOfLines(MAX_LINES);
-                label.setPreferredMaxLayoutWidth(MAX_TEXT_WIDTH);
                 label.setDrawsBackground(false);
+                // Line width = LINE_CHARS of this font, measured once.
+                label.setPreferredMaxLayoutWidth(10_000.0);
+                label.setStringValue(&NSString::from_str(&"0".repeat(LINE_CHARS)));
+                let measured = label.fittingSize().width.ceil();
+                let line_w = if measured > 50.0 { measured } else { MAX_TEXT_WIDTH };
+                label.setPreferredMaxLayoutWidth(line_w);
+                label.setStringValue(&NSString::from_str(""));
                 root.addSubview(&label);
 
                 panel.setContentView(Some(&root));
@@ -605,6 +793,7 @@ mod mac {
                     mtm,
                     shown_key: String::new(),
                     alpha: 0.0,
+                    line_w,
                 }
             }
         }
@@ -633,10 +822,10 @@ mod mac {
             }
             self.shown_key = key;
             self.viz.setHidden(true);
-            self.label.setAlignment(NSTextAlignment::Center);
+            self.label.setAlignment(NSTextAlignment::Left);
             self.label.setStringValue(&NSString::from_str(text));
             let fit = self.label.fittingSize();
-            let text_w = fit.width.min(MAX_TEXT_WIDTH).ceil();
+            let text_w = fit.width.min(self.line_w).ceil();
             let w = (text_w + PAD_X * 2.0).max(MIN_WIDTH);
             let h = (fit.height + PAD_Y * 2.0).ceil();
             self.place(w, h);
@@ -789,18 +978,29 @@ mod mac {
         (syll * phrase * 1.15).clamp(0.0, 1.0)
     }
 
-    fn synth_col(step: usize) -> [f32; SPEC_ROWS] {
+    /// Band levels in dB for the test signal: a -80 dB room, speech up to
+    /// about -25 dB around two drifting formants.
+    fn synth_db(step: usize) -> [f32; SPEC_ROWS] {
         let a = synth_amp(step);
         let s = step as f32;
-        let f1 = 2.0 + (s * 0.07).sin() * 1.2;
-        let f2 = 5.5 + (s * 0.05).cos() * 1.8;
+        let k = SPEC_ROWS as f32 / 10.0;
+        let f1 = (2.0 + (s * 0.07).sin() * 1.2) * k;
+        let f2 = (5.5 + (s * 0.05).cos() * 1.8) * k;
         let mut col = [0.0; SPEC_ROWS];
         for (r, v) in col.iter_mut().enumerate() {
             let r = r as f32;
-            let e = (-(r - f1).powi(2) / 2.0).exp() + 0.7 * (-(r - f2).powi(2) / 3.0).exp();
-            *v = (a * (0.25 + 0.85 * e)).clamp(0.0, 1.0);
+            let e = (-(r - f1).powi(2) / (2.0 * k * k)).exp()
+                + 0.7 * (-(r - f2).powi(2) / (3.0 * k * k)).exp();
+            *v = -80.0 + 55.0 * (a * (0.25 + 0.85 * e)).clamp(0.0, 1.0);
         }
         col
+    }
+
+    /// How long a transcript stays up: time to read it at adult reading
+    /// speed, so a short phrase clears fast and a long one stands.
+    fn linger_secs(text: &str) -> f64 {
+        let words = text.split_whitespace().count() as f64;
+        (LINGER_BASE + words * SECS_PER_WORD).clamp(LINGER_MIN, LINGER_MAX)
     }
 
     /// A message that stays up for a while after the session ends.
@@ -835,12 +1035,44 @@ mod mac {
                 .and_then(|i| args.get(i + 1).cloned())
         };
         let checker = args.iter().any(|a| a == "--checker");
+
+        // --probe-mic <secs>: print what the spectrum sees from the default
+        // input, twice a second (diagnostic; no window).
+        if let Some(secs) = flag("--probe-mic").and_then(|s| s.parse::<f64>().ok()) {
+            let Some(m) = Mic::open() else {
+                eprintln!("probe: no input device");
+                return;
+            };
+            let mut s = Spectro::new();
+            let mut tick = 0u32;
+            let end = Instant::now() + Duration::from_secs_f64(secs);
+            while Instant::now() < end {
+                std::thread::sleep(Duration::from_secs_f64(TICK));
+                let Some(samples) = m.latest() else { continue };
+                let raw = bands(&samples, m.rate);
+                s.push(raw);
+                tick += 1;
+                if tick % 15 == 0 {
+                    let loud = raw.iter().copied().fold(f32::MIN, f32::max);
+                    let lit = s.cols.back().map_or(0, |c| c.iter().filter(|&&t| t > 0.0).count());
+                    let max_t = s.cols.back().map_or(0.0, |c| c.iter().copied().fold(0.0, f32::max));
+                    println!(
+                        "t={:.1}s loudest_band={loud:.1}dB floor~{:.1}dB shown={} voiced={} lit_bands={lit} max_t={max_t:.2}",
+                        tick as f64 * TICK,
+                        s.floor.iter().sum::<f32>() / SPEC_ROWS as f32,
+                        s.shown,
+                        s.gate.voiced
+                    );
+                }
+            }
+            return;
+        }
         let demo_text = flag("--demo");
         let demo_rec = flag("--demo-rec").map(|v| Viz::parse(&v));
         if demo_text.is_some() || demo_rec.is_some() {
             let mut step = 0usize;
             let mut amps: VecDeque<f32> = VecDeque::from(vec![0.0; DOT_COLS]);
-            let mut cols: VecDeque<[f32; SPEC_ROWS]> = VecDeque::new();
+            let mut spectro = Spectro::new();
             let mut frame = |o: &mut Overlay| {
                 if let Some(viz) = demo_rec {
                     step += 1;
@@ -851,11 +1083,8 @@ mod mac {
                             draw_dots(&mut o.canvas, amps.make_contiguous());
                         }
                         Viz::Spectrum => {
-                            if cols.len() == SPEC_COLS {
-                                cols.pop_front();
-                            }
-                            cols.push_back(synth_col(step));
-                            draw_spectrum(&mut o.canvas, &cols);
+                            spectro.push(synth_db(step));
+                            draw_spectrum(&mut o.canvas, &spectro.cols);
                         }
                     }
                     let secs = 3 + step / 30;
@@ -896,7 +1125,7 @@ mod mac {
         let mut rec_start: Option<Instant> = None;
         let mut viz = Viz::Dots;
         let mut mic: Option<Mic> = None;
-        let mut spec_cols: VecDeque<[f32; SPEC_ROWS]> = VecDeque::new();
+        let mut spectro = Spectro::new();
         let parent = std::os::unix::process::parent_id();
 
         loop {
@@ -942,7 +1171,7 @@ mod mac {
                             } else {
                                 t
                             };
-                            let secs = (1.8 + n as f64 * 0.03).clamp(2.0, 6.0);
+                            let secs = linger_secs(&shown);
                             (shown, secs)
                         }),
                         "no_speech" | "empty" => Some(("No speech detected".to_string(), 1.4)),
@@ -966,7 +1195,7 @@ mod mac {
                     linger = None;
                     let local = *rec_start.get_or_insert_with(|| {
                         levels.reset();
-                        spec_cols.clear();
+                        spectro = Spectro::new();
                         viz = Viz::configured();
                         if viz == Viz::Spectrum {
                             mic = Mic::open();
@@ -982,23 +1211,23 @@ mod mac {
                         Some(ms) => now_ms().saturating_sub(ms) / 1000,
                         None => local.elapsed().as_secs(),
                     };
-                    match &mic {
+                    // Hidden until speech starts; fades after a pause.
+                    let speaking = match &mic {
                         Some(m) => {
                             if let Some(samples) = m.latest() {
-                                if spec_cols.len() == SPEC_COLS {
-                                    spec_cols.pop_front();
-                                }
-                                spec_cols.push_back(bands(&samples, m.rate));
+                                spectro.push(bands(&samples, m.rate));
                             }
-                            draw_spectrum(&mut overlay.canvas, &spec_cols);
+                            draw_spectrum(&mut overlay.canvas, &spectro.cols);
+                            spectro.shown
                         }
                         None => {
                             levels.poll();
                             draw_dots(&mut overlay.canvas, &levels.amps);
+                            levels.shown
                         }
-                    }
+                    };
                     overlay.show_recording(&format!("{}:{:02}", elapsed / 60, elapsed % 60));
-                    overlay.animate(true);
+                    overlay.animate(speaking);
                     continue;
                 }
                 "transcribing" => {
@@ -1044,9 +1273,114 @@ mod mac {
                 .max_by(|x, y| x.1.total_cmp(y.1))
                 .unwrap()
                 .0;
-            // 1 kHz sits in band floor(10 * ln(10)/ln(75)) = 5.
-            assert_eq!(loudest, 5, "bands: {b:?}");
-            assert!(b[loudest] > 0.8);
+            // 1 kHz sits in band floor(24 * ln(1000/80) / ln(100)) = 13.
+            assert_eq!(loudest, 13, "bands: {b:?}");
+            // Amplitude 0.5 is -6 dBFS; allow Hann scalloping.
+            assert!(b[loudest] > -9.0 && b[loudest] < -4.0, "bands: {b:?}");
+        }
+
+        fn room() -> [f32; SPEC_ROWS] {
+            [-85.0; SPEC_ROWS]
+        }
+
+        /// Speech-like frame: a loud band, a band 20 dB quieter, rest room.
+        fn voice() -> [f32; SPEC_ROWS] {
+            let mut f = room();
+            f[6] = -30.0;
+            f[7] = -32.0;
+            f[8] = -34.0;
+            f[9] = -36.0;
+            f[10] = -38.0;
+            f[11] = -40.0;
+            f[12] = -42.0;
+            f[13] = -44.0;
+            f[16] = -50.0;
+            f
+        }
+
+        #[test]
+        fn hidden_until_speech_then_fades_after_a_pause() {
+            let mut s = Spectro::new();
+            for i in 0..60 {
+                assert!(!s.push(room()), "shown during silence at tick {i}");
+            }
+            assert!(s.cols.iter().all(|c| c.iter().all(|&t| t == 0.0)), "silence drew something");
+            let shown_at = (0..10).find(|_| s.push(voice())).expect("speech never showed");
+            assert!(shown_at <= 4, "onset took {shown_at} ticks");
+            // A short pause between words keeps the panel up but draws blank.
+            for _ in 0..10 {
+                assert!(s.push(room()));
+            }
+            assert!(s.cols.back().unwrap().iter().all(|&t| t == 0.0));
+            // A long pause hides it.
+            let hidden = (0..60).any(|_| !s.push(room()));
+            assert!(hidden, "panel never hid after a long pause");
+        }
+
+        #[test]
+        fn short_text_clears_fast_long_text_stands() {
+            assert_eq!(linger_secs("Okay."), LINGER_MIN);
+            let ten = "one two three four five six seven eight nine ten";
+            assert!((linger_secs(ten) - 3.5).abs() < 1e-9);
+            let long = "word ".repeat(60);
+            assert_eq!(linger_secs(&long), LINGER_MAX);
+            assert!(linger_secs("a b c") < linger_secs(ten));
+        }
+
+        #[test]
+        fn startup_zeros_and_room_noise_never_show() {
+            let mut s = Spectro::new();
+            // The mic's first buffers are exact zeros (-180 dB).
+            for _ in 0..5 {
+                assert!(!s.push([-180.0; SPEC_ROWS]));
+            }
+            // Then a fluctuating room: +/- 5 dB per band, no speech.
+            for i in 0..150 {
+                let mut f = room();
+                for (b, v) in f.iter_mut().enumerate() {
+                    *v += 5.0 * ((i * 7 + b * 13) as f32 * 0.9).sin();
+                }
+                assert!(!s.push(f), "room noise showed at tick {i}");
+            }
+        }
+
+        #[test]
+        fn loudest_reads_yellow_and_quieter_reads_purple() {
+            let mut s = Spectro::new();
+            for _ in 0..30 {
+                s.push(room());
+            }
+            for _ in 0..10 {
+                s.push(voice());
+            }
+            let col = *s.cols.back().unwrap();
+            assert!(col[6] > 0.9, "loudest band t={}", col[6]);
+            assert!(col[16] > 0.0 && col[16] < 0.7, "quiet band t={}", col[16]);
+            assert_eq!(col[0], 0.0, "room-level band drew");
+            // Pitch moves: shift the voice up and the lit rows follow.
+            let mut high = room();
+            high[18] = -30.0;
+            high[19] = -32.0;
+            for _ in 0..10 {
+                s.push(high);
+            }
+            let col = *s.cols.back().unwrap();
+            assert!(col[18] > 0.8 && col[6] == 0.0, "col={col:?}");
+        }
+
+        #[test]
+        fn spectrum_has_no_gaps() {
+            let cols: VecDeque<[f32; SPEC_ROWS]> =
+                (0..SPEC_COLS).map(|_| [0.5f32; SPEC_ROWS]).collect();
+            let mut c = Canvas::new();
+            draw_spectrum(&mut c, &cols);
+            let fade_end = (PX_W as f32 * 0.12).ceil() as usize;
+            for y in 0..PX_H {
+                for x in fade_end..PX_W {
+                    let a = c.px[(y * PX_W + x) * 4 + 3];
+                    assert!(a >= 240, "seam at x={x} y={y}: alpha {a}");
+                }
+            }
         }
 
         #[test]

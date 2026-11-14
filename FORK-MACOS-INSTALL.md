@@ -6,7 +6,7 @@ This fork (`zoos1/voxtype`, branch `macos`) tracks upstream
 | Addition | Where |
 |---|---|
 | Source build with **Parakeet TDT 0.6B v3 (int8)** + Metal, about 0.3 s decode for a 12 s utterance on Apple Silicon | `scripts/macos-local-install.ts` |
-| **Native macOS on-screen display**: small centered see-through smoke panel, white JetBrains Mono; dot-waveform or spectrogram while recording, "Transcribing…", then the transcript | `src/bin/voxtype_osd_macos.rs` |
+| **Native macOS on-screen display**: small centered see-through smoke panel, white JetBrains Mono; dot-waveform or voice-driven spectrogram that appears when you speak, "Transcribing…", then the transcript | `src/bin/voxtype_osd_macos.rs` |
 | `voxtype-osd` launcher execs the macOS overlay | `src/bin/voxtype_osd.rs` |
 | **LaunchAgent service**: starts at login, launchd restarts the daemon if it dies | `scripts/macos-service.ts` |
 | Daemon publishes the delivered text to `$runtime/last_text` (mode 0600) for the overlay | `src/osd/session.rs`, `src/daemon.rs` |
@@ -168,11 +168,25 @@ git push --force-with-lease origin macos
   ```
 
   `dots` uses the daemon's level stream. `spectrum` taps the default input
-  device itself while recording (1024-point FFT, 10 log bands, 100 Hz to
-  7.5 kHz); it falls back to dots if no input opens. `VOXTYPE_OSD_VIZ`
-  overrides the config.
+  device itself while recording (2048-point FFT, 24 log bands, 80 Hz to
+  8 kHz, drawn as one continuous image): silence draws nothing, the
+  loudest recent speech is yellow and quieter speech fades through pink to
+  dark purple, and the lit rows follow your pitch. It falls back to dots if
+  no input opens. `VOXTYPE_OSD_VIZ` overrides the config.
+
+- Speech gate: while recording, the panel stays hidden until you start
+  talking (about 14 dB over the room's noise floor for 130 ms), and fades
+  after 1.2 s of quiet. The floor is the 10th percentile of the last 3 s, so
+  it adapts to the room. Other loud sounds that last as long as a syllable
+  (someone else talking, a TV) can still open it.
+
+- Transcript: left-aligned, wrapped at 40 characters a line (phone-feed
+  width), up to 10 lines. It stays up 1 s plus 0.25 s a word (adult silent
+  reading is about 238 words a minute, Brysbaert 2019), from 1.5 s to 12 s.
 
 - Demo and snapshots: `voxtype-osd-macos --demo "<text>"` or
   `--demo-rec dots|spectrum` shows the panel for 4 s with a test signal; add
   `--snapshot out.png` to render a PNG instead, and `--checker` to composite
   it over a checkerboard so the transparency is visible.
+  `voxtype-osd-macos --probe-mic 10` prints what the spectrum hears (band
+  levels, noise floor, gate state) twice a second, with no window.
