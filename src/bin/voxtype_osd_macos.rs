@@ -84,12 +84,12 @@ mod mac {
     const CORNER: f64 = 10.0;
     const MAX_TEXT_CHARS: usize = 400;
     const MAX_LINES: isize = 10;
-    // Transcript display time: ~238 wpm adult silent reading (Brysbaert
-    // 2019), so 0.25 s a word plus a second to find the panel.
-    const SECS_PER_WORD: f64 = 0.25;
-    const LINGER_BASE: f64 = 1.0;
-    const LINGER_MIN: f64 = 1.5;
-    const LINGER_MAX: f64 = 12.0;
+    // Transcript display time: a glance to confirm words you just spoke,
+    // not a read: ~1000 wpm skim (0.06 s a word) on a short base.
+    const SECS_PER_WORD: f64 = 0.06;
+    const LINGER_BASE: f64 = 0.5;
+    const LINGER_MIN: f64 = 0.8;
+    const LINGER_MAX: f64 = 3.0;
     /// Smoke: near-black grey, mostly see-through.
     const SMOKE: (f64, f64, f64, f64) = (0.10, 0.10, 0.11, 0.55);
 
@@ -1321,7 +1321,7 @@ mod mac {
         fn short_text_clears_fast_long_text_stands() {
             assert_eq!(linger_secs("Okay."), LINGER_MIN);
             let ten = "one two three four five six seven eight nine ten";
-            assert!((linger_secs(ten) - 3.5).abs() < 1e-9);
+            assert!((linger_secs(ten) - 1.1).abs() < 1e-9);
             let long = "word ".repeat(60);
             assert_eq!(linger_secs(&long), LINGER_MAX);
             assert!(linger_secs("a b c") < linger_secs(ten));

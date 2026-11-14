@@ -181,8 +181,8 @@ git push --force-with-lease origin macos
   (someone else talking, a TV) can still open it.
 
 - Transcript: left-aligned, wrapped at 40 characters a line (phone-feed
-  width), up to 10 lines. It stays up 1 s plus 0.25 s a word (adult silent
-  reading is about 238 words a minute, Brysbaert 2019), from 1.5 s to 12 s.
+  width), up to 10 lines. It stays up just long enough to glance at
+  words you just spoke: 0.5 s plus 0.06 s a word, from 0.8 s to 3 s.
 
 - Demo and snapshots: `voxtype-osd-macos --demo "<text>"` or
   `--demo-rec dots|spectrum` shows the panel for 4 s with a test signal; add
