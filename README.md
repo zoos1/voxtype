@@ -1,5 +1,7 @@
 # Voxtype
 
+> **Fork note (zoos1/voxtype, branch `macos`):** macOS source build with Parakeet and a native on-screen display. Install and restore: [FORK-MACOS-INSTALL.md](FORK-MACOS-INSTALL.md).
+
 [![Voxtype - Voice to Text for Linux](website/images/og-preview.png)](https://voxtype.io)
 
 **[voxtype.io](https://voxtype.io)**

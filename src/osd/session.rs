@@ -100,6 +100,33 @@ pub fn write_outcome(dir: &Path, outcome: &OsdOutcome) {
     write_json_atomic(&dir.join(OUTCOME_FILE), outcome);
 }
 
+/// Last delivered transcript, for OSD frontends that echo the text back.
+/// Written owner-only (0600) because it holds what the user dictated.
+pub const TEXT_FILE: &str = "last_text";
+
+pub fn write_text(dir: &Path, text: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!("Failed to create {:?}: {}", dir, e);
+        return;
+    }
+    let path = dir.join(TEXT_FILE);
+    let staged = staged_path(&path);
+    let _ = std::fs::remove_file(&staged);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staged)
+        .and_then(|mut f| f.write_all(text.as_bytes()));
+    if let Err(e) = written.and_then(|_| std::fs::rename(&staged, &path)) {
+        tracing::warn!("Failed to publish {:?}: {}", path, e);
+        let _ = std::fs::remove_file(&staged);
+    }
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) {
     let body = match serde_json::to_string(value) {
         Ok(json) => json,
@@ -214,5 +241,21 @@ mod tests {
         let nested = dir.path().join("voxtype");
         write_session(&nested, &session());
         assert!(nested.join(SESSION_FILE).exists());
+    }
+
+    #[test]
+    fn text_is_written_owner_only_and_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_text(dir.path(), "first");
+        write_text(dir.path(), "second transcript");
+        let path = dir.path().join(TEXT_FILE);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second transcript");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // No staged temp files left behind.
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1);
     }
 }

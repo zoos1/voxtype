@@ -1543,6 +1543,16 @@ impl Daemon {
         } else {
             osd::session::OutcomeKind::Ok
         };
+        // Publish the text before the outcome, so an OSD that reacts to the
+        // fresh outcome.json always finds the matching transcript.
+        if chars > 0
+            && self.state_file_path.is_some()
+            && !self
+                .osd_outcome_sent
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            osd::session::write_text(&Config::runtime_dir(), text);
+        }
         self.publish_osd_outcome(kind, chars);
     }
 

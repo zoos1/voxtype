@@ -49,7 +49,12 @@ use voxtype::osd::config::{OsdConfig, OsdFrontend};
 const NATIVE_BIN: &str = "voxtype-osd-native";
 const GTK4_BIN: &str = "voxtype-osd-gtk4";
 const QUICKSHELL_BIN: &str = "voxtype-osd-quickshell";
+#[cfg(target_os = "macos")]
+const MACOS_BIN: &str = "voxtype-osd-macos";
 
+// On macOS the AppKit branch below always returns, so the Linux dispatch
+// after it is unreachable there by design.
+#[cfg_attr(target_os = "macos", allow(unreachable_code, unused_variables))]
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -66,6 +71,18 @@ fn main() -> ExitCode {
     if raw_args.iter().any(|a| a == "--version" || a == "-V") {
         println!("voxtype-osd {}", voxtype::cli::VERSION);
         return ExitCode::SUCCESS;
+    }
+
+    // macOS has one frontend: the native AppKit overlay.
+    #[cfg(target_os = "macos")]
+    {
+        let Some(path) = find_binary(MACOS_BIN) else {
+            eprintln!("voxtype-osd: '{MACOS_BIN}' not found next to voxtype-osd or on PATH");
+            return ExitCode::FAILURE;
+        };
+        let err = Command::new(&path).args(&raw_args).exec();
+        eprintln!("voxtype-osd: failed to exec '{}': {err}", path.display());
+        return ExitCode::FAILURE;
     }
 
     // Strip `--frontend X` and `--frontend=X` from the args so the chosen
