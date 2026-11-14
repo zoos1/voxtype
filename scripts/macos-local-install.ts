@@ -10,6 +10,7 @@
  *   bun scripts/macos-local-install.ts            # build + install + model + config
  *   bun scripts/macos-local-install.ts --no-build # reinstall an existing build
  *   bun scripts/macos-local-install.ts --no-config
+ *   bun scripts/macos-local-install.ts --service  # also refresh the LaunchAgent
  *
  * Idempotent: safe to re-run after every pull or local commit.
  */
@@ -74,4 +75,13 @@ if (!args.has("--no-config")) {
 }
 
 const installed = (await $`${voxtype} --version`.text()).trim();
-console.log(`\n${installed} installed. Restart the daemon (Ctrl-C, then: voxtype daemon).`);
+if (args.has("--service")) {
+  // Update the LaunchAgent's app bundle and restart it (scripts/macos-service.ts).
+  await $`bun ${join(repo, "scripts", "macos-service.ts")} refresh`;
+  console.log(`\n${installed} installed; service refreshed.`);
+} else {
+  console.log(
+    `\n${installed} installed. Service users: bun scripts/macos-service.ts refresh` +
+      ` (overlay-only change: pkill -x voxtype-osd-macos, and the daemon relaunches it).`,
+  );
+}

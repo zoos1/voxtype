@@ -99,6 +99,16 @@ impl HotkeyListener for RdevHotkeyListener {
                         // Remove lock file so the new process can acquire it
                         let lock_path = crate::config::Config::runtime_dir().join("voxtype.lock");
                         let _ = std::fs::remove_file(&lock_path);
+                        // Under a launchd KeepAlive job (fork: scripts/macos-service.ts)
+                        // launchd starts the fresh process; spawning one here races it
+                        // for the lock. launchd sets XPC_SERVICE_NAME to the job label;
+                        // terminals carry "0".
+                        if std::env::var("XPC_SERVICE_NAME")
+                            .map(|v| !v.is_empty() && v != "0")
+                            .unwrap_or(false)
+                        {
+                            std::process::exit(0);
+                        }
                         // Spawn a new daemon and exit. The dead CGEvent tap in this
                         // process can't be revived; a fresh process is needed.
                         let exe = std::env::current_exe().expect("current_exe");

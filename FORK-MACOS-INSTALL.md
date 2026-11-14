@@ -6,8 +6,9 @@ This fork (`zoos1/voxtype`, branch `macos`) tracks upstream
 | Addition | Where |
 |---|---|
 | Source build with **Parakeet TDT 0.6B v3 (int8)** + Metal, about 0.3 s decode for a 12 s utterance on Apple Silicon | `scripts/macos-local-install.ts` |
-| **Native macOS on-screen display**: centered, smoke-glass background, white text; live level strip while recording, "Transcribing…", then the transcript | `src/bin/voxtype_osd_macos.rs` |
+| **Native macOS on-screen display**: small centered see-through smoke panel, white JetBrains Mono; dot-waveform or spectrogram while recording, "Transcribing…", then the transcript | `src/bin/voxtype_osd_macos.rs` |
 | `voxtype-osd` launcher execs the macOS overlay | `src/bin/voxtype_osd.rs` |
+| **LaunchAgent service**: starts at login, launchd restarts the daemon if it dies | `scripts/macos-service.ts` |
 | Daemon publishes the delivered text to `$runtime/last_text` (mode 0600) for the overlay | `src/osd/session.rs`, `src/daemon.rs` |
 
 The upstream macOS release binary ships without the `parakeet` feature, so
@@ -72,22 +73,37 @@ flash_attention = true        # if you switch back to Whisper
 replacements = { "vox type" = "voxtype" }   # fix names the model mishears
 ```
 
-## 5. Run the daemon and grant permissions
-
-Run the daemon from a terminal app that has the permissions. macOS grants
-them to the terminal, not to the binary:
+## 5. Run the daemon as a service (starts at login, restarts if it dies)
 
 ```sh
-voxtype daemon
+bun scripts/macos-service.ts install
 ```
 
-In System Settings > Privacy & Security, give that terminal **Microphone**,
-**Accessibility** (to type text) and **Input Monitoring** (for the FN hotkey).
-The daemon starts the overlay itself; its log shows `OSD child started`.
+This copies the `voxtype` binary into `/Applications/Voxtype.app` (bundle id
+`io.voxtype.daemon`, ad-hoc signed) and loads the LaunchAgent
+`~/Library/LaunchAgents/io.voxtype.daemon.plist` with `RunAtLoad` and
+`KeepAlive`: launchd starts the daemon at login and restarts it within 5 s
+whenever it exits or crashes. Logs: `~/Library/Logs/voxtype/daemon.out.log`.
 
-Alternative: `voxtype setup app-bundle` creates `/Applications/Voxtype.app`
-with Login Items, which holds its own permissions (not yet tested with this
-fork's build).
+Grant **Voxtype** in System Settings > Privacy & Security: **Microphone**
+(allow the prompt), **Accessibility** (to type text) and, if the FN hotkey
+does not respond, **Input Monitoring**. The daemon starts the overlay itself;
+its log shows `OSD child started`.
+
+```sh
+bun scripts/macos-service.ts status      # state, pid, run count
+bun scripts/macos-service.ts refresh     # after rebuilding voxtype
+bun scripts/macos-service.ts uninstall   # stop and remove the LaunchAgent
+```
+
+Do not also run `voxtype daemon` in a terminal or add Voxtype to Login
+Items: the second instance fails on the lock. Replacing the main binary
+changes its ad-hoc signature, so `refresh` resets and re-asks for the three
+permissions only when the binary actually changed. Rebuilding just the
+overlay never touches them (the overlay binaries live outside the bundle).
+
+Without the service: run `voxtype daemon` from a terminal that holds the
+three permissions (macOS then grants them to the terminal).
 
 ## 6. Verify
 
@@ -139,6 +155,24 @@ git push --force-with-lease origin macos
 - Click-through, never takes focus, shows on all Spaces and over full-screen
   apps, and centers on the screen that has keyboard focus.
 
-- `voxtype-osd-macos --demo "<text>" --snapshot out.png` renders the panel to
-  a PNG. The snapshot does not capture the live blur; it shows the flat
-  fallback color.
+- Look: a small see-through smoke panel (55% opaque near-black), rounded
+  corners, no border or shadow, white JetBrains Mono Light 12 pt (falls back
+  to the system monospaced font).
+
+- Recording visualizer, set in `config.toml` and read at each recording:
+
+  ```toml
+  [osd]
+  macos_visualizer = "dots"      # white-dot waveform (default)
+  # macos_visualizer = "spectrum" # purple > pink > yellow spectrogram
+  ```
+
+  `dots` uses the daemon's level stream. `spectrum` taps the default input
+  device itself while recording (1024-point FFT, 10 log bands, 100 Hz to
+  7.5 kHz); it falls back to dots if no input opens. `VOXTYPE_OSD_VIZ`
+  overrides the config.
+
+- Demo and snapshots: `voxtype-osd-macos --demo "<text>"` or
+  `--demo-rec dots|spectrum` shows the panel for 4 s with a test signal; add
+  `--snapshot out.png` to render a PNG instead, and `--checker` to composite
+  it over a checkerboard so the transparency is visible.
