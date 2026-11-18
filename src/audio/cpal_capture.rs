@@ -377,6 +377,30 @@ impl AudioCapture for CpalCapture {
             duration_secs
         );
 
+        // Debug: VOXTYPE_DUMP_DIR=<dir> keeps each recording as a 16-bit WAV.
+        if let Ok(dir) = std::env::var("VOXTYPE_DUMP_DIR") {
+            let path = std::path::Path::new(&dir).join(format!(
+                "rec-{}.wav",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ));
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: self.config.sample_rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            if let Ok(mut w) = hound::WavWriter::create(&path, spec) {
+                for s in &samples {
+                    let _ = w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+                }
+                let _ = w.finalize();
+                tracing::info!("capture: dumped {} samples to {:?}", samples.len(), path);
+            }
+        }
+
         if samples.is_empty() {
             return Err(AudioError::EmptyRecording);
         }
@@ -428,10 +452,22 @@ where
         ..
     } = params;
 
+    // Start-of-capture timing: how long until the first callback and the
+    // first non-silent sample. A recording that loses its opening words
+    // shows up here as a late first callback or a long zero run.
+    let t0 = std::time::Instant::now();
+    let mut first_cb = true;
+    let mut seen_signal = false;
+    let mut zero_frames: usize = 0;
+
     let stream = device
         .build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
+                if first_cb {
+                    first_cb = false;
+                    tracing::info!("capture: first callback after {} ms", t0.elapsed().as_millis());
+                }
                 // Convert to f32 and mix to mono
                 let mono_f32: Vec<f32> = data
                     .chunks(source_channels)
@@ -443,6 +479,19 @@ where
                         sum / source_channels as f32
                     })
                     .collect();
+
+                if !seen_signal {
+                    if mono_f32.iter().any(|x| x.abs() > 1e-4) {
+                        seen_signal = true;
+                        tracing::info!(
+                            "capture: first signal after {} ms ({} silent frames before it)",
+                            t0.elapsed().as_millis(),
+                            zero_frames
+                        );
+                    } else {
+                        zero_frames += mono_f32.len();
+                    }
+                }
 
                 // Resample if needed. The resampler is stateful and lives as
                 // long as the stream: converting each callback independently
